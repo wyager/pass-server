@@ -28,6 +28,7 @@ executable pass-server
                        bytestring,
                        wreq,
                        http-client-tls,
+                       http-types,
                        connection,
                        tls,
                        network,

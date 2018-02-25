@@ -1,0 +1,18 @@
+[ req ]
+default_bits        = 2048 
+default_keyfile     = key.pem 
+distinguished_name  = req_distinguished_name
+req_extensions          = v3_req
+x509_extensions         = v3_ca
+
+[ req_distinguished_name ]
+
+[ v3_req ]
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment
+
+[ v3_ca ]
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always,issuer:always
+subjectAltName         = email:myEmail@email.com
+issuerAltName          = issuer:copy
