@@ -1,9 +1,15 @@
 
 -- General
 import qualified Data.ByteString as BS
+import qualified Data.Text as Text
 import Data.Monoid ((<>))
 import Control.Applicative ((<|>))
-import qualified Data.Time.Clock as Clock
+import Control.Monad (when)
+import GHC.Generics (Generic)
+import qualified Data.Aeson as Aeson
+import qualified Data.Tree as Tree
+import qualified Path
+import Data.List (intercalate)
 -- PEM loading
 import qualified Data.X509 as X509
 import qualified Data.X509.CertificateStore as X509CS
@@ -11,7 +17,7 @@ import qualified Data.X509.Memory as X509M
 import qualified Data.PEM as PEM
 -- Client
 import qualified Network.Wreq as Wreq
-import Control.Lens ((&), (.~))
+import Control.Lens ((&), (.~), (%~), _Left)
 import qualified Network.HTTP.Client.TLS as TLSClient
 import qualified Network.Connection as Connection
 import qualified Network.TLS as TLS
@@ -27,9 +33,22 @@ import qualified Network.HTTP.Types.Header as Header
 -- Command line
 import qualified Options.Applicative as Opt
 
+type Request = Path.Path Path.Rel Path.File
+
+data Response = NotFound | Password Text.Text | Directory (Tree.Tree FilePath) 
+    deriving stock Generic
+    deriving anyclass (Aeson.ToJSON, Aeson.FromJSON)
+
 data Action
-    = Client {clientCertPath :: FilePath, clientKeyPath :: FilePath, serverHost :: TLS.HostName, serverCertPath :: FilePath}
-    | Server {serverCertPath :: FilePath, serverKeyPath :: FilePath, clientCertsPaths :: FilePath}
+    = Client { clientCertPath :: FilePath
+             , clientKeyPath :: FilePath
+             , serverHost :: TLS.HostName
+             , serverCertPath :: FilePath
+             , request :: Request}
+    | Server { serverCertPath :: FilePath
+             , serverKeyPath :: FilePath
+             , clientCertsPaths :: FilePath
+             , passDir :: FilePath}
 
 action :: Opt.Parser Action
 action = client <|> server
@@ -43,10 +62,12 @@ action = client <|> server
     serverOpts = Server <$> Opt.strOption (certPathFor "server") 
                         <*> Opt.strOption (keyPathFor "server") 
                         <*> Opt.strOption (oneOrMoreCertsPathFor "client")
+                        <*> Opt.strOption passDir
     clientOpts = Client <$> Opt.strOption (certPathFor "client")
                         <*> Opt.strOption (keyPathFor "client") 
                         <*> Opt.strOption serverHost
                         <*> Opt.strOption (certPathFor "server")
+                        <*> Opt.option (Opt.eitherReader parseRelFile) request
     certPathFor host = Opt.long (host ++ "-cert-path" )
                     <> Opt.metavar "FILE.pem" 
                     <> Opt.help ("The PEM file containing the " ++ host ++ "'s TLS cert")
@@ -65,13 +86,21 @@ action = client <|> server
     serverHost = Opt.long "server-host"
               <> Opt.metavar "HOST"
               <> Opt.help "The server's hostname"
+    passDir = Opt.long "pass-dir"
+           <> Opt.metavar "PATH"
+           <> Opt.help "The root directory of the pass installation"
+           <> Opt.value ("~/.password-store/")
+    parseRelFile = (_Left %~ show) . Path.parseRelFile
+    request = Opt.long "request"
+           <> Opt.metavar "PATH"
+           <> Opt.help "The path to the (set of) passwords you want"
 
 main :: IO ()
 main = do
     opts <- Opt.execParser (Opt.info (Opt.helper <*> action) Opt.fullDesc)
     case opts of
-        Client certPath keyPath serverHost serverCertPath -> client certPath keyPath serverHost serverCertPath
-        Server certPath keyPath clientCertsPath -> server certPath keyPath clientCertsPath
+        Client certPath keyPath serverHost serverCertPath request -> client certPath keyPath serverHost serverCertPath request
+        Server certPath keyPath clientCertsPath passDir -> server certPath keyPath clientCertsPath passDir
 
 
 decodeCertsPem :: BS.ByteString -> Either String [X509.SignedCertificate]
@@ -98,13 +127,14 @@ loadKeyPem :: FilePath -> IO (Either String X509.PrivKey)
 loadKeyPem path = decodeKeyPem <$> BS.readFile path
 
 
-client :: FilePath -> FilePath -> TLS.HostName -> FilePath -> IO ()
-client certPath keyPath serverHost serverCertPath = do
+client :: FilePath -> FilePath -> TLS.HostName -> FilePath -> Request -> IO ()
+client certPath keyPath serverHost serverCertPath request = do
     cert       <- either error id <$> loadCertPem certPath
     key        <- either error id <$> loadKeyPem keyPath
     serverCert <- either error id <$> loadCertPem serverCertPath
     let credential = (X509.CertificateChain [cert], key)
-    res <- Wreq.getWith (managerWithCert serverHost serverCert credential) ("https://" ++ serverHost ++ "/")
+        path = "https://" ++ serverHost ++ "/" ++ Path.toFilePath request
+    res <- Wreq.getWith (managerWithCert serverHost serverCert credential) path
     print res
 
 managerWithCert :: TLS.HostName -> X509.SignedCertificate -> TLS.Credential -> Wreq.Options
@@ -126,13 +156,13 @@ managerWithCert hostname cert cred = Wreq.defaults & Wreq.manager .~ Left mgrSet
         TLS.clientDebug = def
     }
 
-server :: FilePath -> FilePath -> FilePath -> IO ()
-server certPath keyPath clientCertsPath = do
+server :: FilePath -> FilePath -> FilePath -> FilePath -> IO ()
+server certPath keyPath clientCertsPath passDir = do
     allowedCerts <- either error id <$> loadCertsPem clientCertsPath
     let checkCertChain certChain = if any (== certChain) (map (\cert -> X509.CertificateChain [cert]) allowedCerts)
             then TLS.CertificateUsageAccept
             else TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
-    WarpTLS.runTLS (tlsSettings checkCertChain) settings serverApp
+    WarpTLS.runTLS (tlsSettings checkCertChain) settings (serverApp passDir)
     where
     tlsSettings checkCertChain =  (WarpTLS.tlsSettings certPath keyPath) {
         WarpTLS.tlsWantClientCert = True,
@@ -142,7 +172,19 @@ server certPath keyPath clientCertsPath = do
     }
     settings = Warp.defaultSettings
 
-serverApp :: Wai.Application
-serverApp req send = send (Wai.responseLBS Status.status200 [] "lookin' good")
+serverApp :: FilePath -> Wai.Application
+serverApp root req send = do
+    let path = Wai.pathInfo req
+        dangerous path = Text.any (== '/') path || path == ".."
+    -- Not worrying about this too much, since if someone has gotten this far they have
+    -- already compromised our certificate infra
+    when (any dangerous path) (error "Path contains dangerous stuff") 
+    let fullpath = root ++ "/" ++ intercalate "/" (map Text.unpack path)
+    directory <- readDirectoryWith return fullpath
+    let resp = case directory of 
+            Failed _ _ -> NotFound
+            Dir name contents -> Directory (dirTreeToTree contents)
+            File name path -> loadPassAt path
+    send (Wai.responseLBS Status.status200 [] (Aeson.encode path))
 
 

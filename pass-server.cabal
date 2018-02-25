@@ -17,7 +17,7 @@ cabal-version:       >=1.10
 
 executable pass-server
   main-is:             Main.hs
-  default-extensions:  OverloadedStrings, LambdaCase
+  default-extensions:  OverloadedStrings, LambdaCase, DeriveGeneric, DeriveAnyClass, DerivingStrategies
   ghc-options:         -O2
   -- other-modules:       
   -- other-extensions:    
@@ -38,6 +38,10 @@ executable pass-server
                        wai,
                        lens,
                        optparse-applicative,
-                       time
+                       aeson,
+                       containers,
+                       path,
+                       text,
+                       directory-tree
   hs-source-dirs:      src
   default-language:    Haskell2010
