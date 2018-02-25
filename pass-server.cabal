@@ -18,7 +18,7 @@ cabal-version:       >=1.10
 executable pass-server
   main-is:             Main.hs
   default-extensions:  OverloadedStrings, LambdaCase
-  ghc-options:         
+  ghc-options:         -O2
   -- other-modules:       
   -- other-extensions:    
   build-depends:       base,
