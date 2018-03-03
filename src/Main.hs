@@ -29,7 +29,8 @@ import qualified Network.Wai.Handler.Warp as Warp
 import qualified Network.Wai.Handler.WarpTLS as WarpTLS
 import qualified Network.Wai as Wai
 import qualified Network.HTTP.Types.Status as Status
-import qualified Network.HTTP.Types.Header as Header
+import qualified Network.HTTP.Types.Header as Headers
+import qualified System.Directory.Tree as DirTree
 -- Command line
 import qualified Options.Applicative as Opt
 
@@ -180,11 +181,20 @@ serverApp root req send = do
     -- already compromised our certificate infra
     when (any dangerous path) (error "Path contains dangerous stuff") 
     let fullpath = root ++ "/" ++ intercalate "/" (map Text.unpack path)
-    directory <- readDirectoryWith return fullpath
-    let resp = case directory of 
-            Failed _ _ -> NotFound
-            Dir name contents -> Directory (dirTreeToTree contents)
-            File name path -> loadPassAt path
-    send (Wai.responseLBS Status.status200 [] (Aeson.encode path))
+    anchodr DirTree.:/ dirTree <- DirTree.readDirectoryWith return fullpath
+    resp <- dirTreeToResp dirTree
+    send (Wai.responseLBS Status.status200 [] (Aeson.encode resp))
 
+dirTreeToResp :: DirTree.DirTree FilePath -> IO Response
+dirTreeToResp dir = case dir of 
+            DirTree.Failed _ _ -> return NotFound
+            DirTree.Dir name contents -> return (Directory (go name contents))
+            DirTree.File name path -> loadPassAt path
+    where
+    go name contents = Tree.Node name $ concatMap go' contents
+    go' (DirTree.Failed _ _) = []
+    go' (DirTree.Dir name contents) = [go name contents]
+    go' (DirTree.File name path) = [go name []]
 
+loadPassAt :: FilePath -> IO Text
+loadPassAt path = 
