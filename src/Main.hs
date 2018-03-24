@@ -2,6 +2,7 @@
 -- General
 import qualified Data.ByteString as BS
 import qualified Data.Text as Text
+import qualified Data.Text.IO as TextIO
 import Data.Monoid ((<>))
 import Control.Applicative ((<|>))
 import Control.Monad (when)
@@ -31,12 +32,17 @@ import qualified Network.Wai as Wai
 import qualified Network.HTTP.Types.Status as Status
 import qualified Network.HTTP.Types.Header as Headers
 import qualified System.Directory.Tree as DirTree
+import qualified System.Process as Proc
 -- Command line
 import qualified Options.Applicative as Opt
 
 type Request = Path.Path Path.Rel Path.File
 
-data Response = NotFound | Password Text.Text | Directory (Tree.Tree FilePath) 
+data PassError = NotFound | NoHandle 
+    deriving stock Generic
+    deriving anyclass (Aeson.ToJSON, Aeson.FromJSON)
+
+data Response = Error PassError | Password Text.Text | Directory (Tree.Tree FilePath) 
     deriving stock Generic
     deriving anyclass (Aeson.ToJSON, Aeson.FromJSON)
 
@@ -49,7 +55,8 @@ data Action
     | Server { serverCertPath :: FilePath
              , serverKeyPath :: FilePath
              , clientCertsPaths :: FilePath
-             , passDir :: FilePath}
+             , passDir :: FilePath
+             , passBinaryLocation :: FilePath}
 
 action :: Opt.Parser Action
 action = client <|> server
@@ -64,6 +71,7 @@ action = client <|> server
                         <*> Opt.strOption (keyPathFor "server") 
                         <*> Opt.strOption (oneOrMoreCertsPathFor "client")
                         <*> Opt.strOption passDir
+                        <*> Opt.strOption passBinaryLoc
     clientOpts = Client <$> Opt.strOption (certPathFor "client")
                         <*> Opt.strOption (keyPathFor "client") 
                         <*> Opt.strOption serverHost
@@ -91,6 +99,10 @@ action = client <|> server
            <> Opt.metavar "PATH"
            <> Opt.help "The root directory of the pass installation"
            <> Opt.value ("~/.password-store/")
+    passBinaryLoc = Opt.long "pass-binary"
+                 <> Opt.metavar "PATH"
+                 <> Opt.help "The location of the pass binary"
+                 <> Opt.value ("/usr/bin/pass")
     parseRelFile = (_Left %~ show) . Path.parseRelFile
     request = Opt.long "request"
            <> Opt.metavar "PATH"
@@ -100,8 +112,10 @@ main :: IO ()
 main = do
     opts <- Opt.execParser (Opt.info (Opt.helper <*> action) Opt.fullDesc)
     case opts of
-        Client certPath keyPath serverHost serverCertPath request -> client certPath keyPath serverHost serverCertPath request
-        Server certPath keyPath clientCertsPath passDir -> server certPath keyPath clientCertsPath passDir
+        Client certPath keyPath serverHost serverCertPath request -> 
+            client certPath keyPath serverHost serverCertPath request
+        Server certPath keyPath clientCertsPath passDir passBinary -> 
+            server certPath keyPath clientCertsPath passDir passBinary
 
 
 decodeCertsPem :: BS.ByteString -> Either String [X509.SignedCertificate]
@@ -157,13 +171,13 @@ managerWithCert hostname cert cred = Wreq.defaults & Wreq.manager .~ Left mgrSet
         TLS.clientDebug = def
     }
 
-server :: FilePath -> FilePath -> FilePath -> FilePath -> IO ()
-server certPath keyPath clientCertsPath passDir = do
+server :: FilePath -> FilePath -> FilePath -> FilePath -> FilePath -> IO ()
+server certPath keyPath clientCertsPath passDir passBinary = do
     allowedCerts <- either error id <$> loadCertsPem clientCertsPath
     let checkCertChain certChain = if any (== certChain) (map (\cert -> X509.CertificateChain [cert]) allowedCerts)
             then TLS.CertificateUsageAccept
             else TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
-    WarpTLS.runTLS (tlsSettings checkCertChain) settings (serverApp passDir)
+    WarpTLS.runTLS (tlsSettings checkCertChain) settings (serverApp passDir passBinary)
     where
     tlsSettings checkCertChain =  (WarpTLS.tlsSettings certPath keyPath) {
         WarpTLS.tlsWantClientCert = True,
@@ -173,8 +187,8 @@ server certPath keyPath clientCertsPath passDir = do
     }
     settings = Warp.defaultSettings
 
-serverApp :: FilePath -> Wai.Application
-serverApp root req send = do
+serverApp :: FilePath -> FilePath -> Wai.Application
+serverApp root passBin req send = do
     let path = Wai.pathInfo req
         dangerous path = Text.any (== '/') path || path == ".."
     -- Not worrying about this too much, since if someone has gotten this far they have
@@ -182,19 +196,34 @@ serverApp root req send = do
     when (any dangerous path) (error "Path contains dangerous stuff") 
     let fullpath = root ++ "/" ++ intercalate "/" (map Text.unpack path)
     anchodr DirTree.:/ dirTree <- DirTree.readDirectoryWith return fullpath
-    resp <- dirTreeToResp dirTree
+    resp <- dirTreeToResp (loadPassWith passBin) dirTree
     send (Wai.responseLBS Status.status200 [] (Aeson.encode resp))
 
-dirTreeToResp :: DirTree.DirTree FilePath -> IO Response
-dirTreeToResp dir = case dir of 
-            DirTree.Failed _ _ -> return NotFound
+dirTreeToResp :: (FilePath -> IO (Either PassError Text.Text)) -> DirTree.DirTree FilePath -> IO Response
+dirTreeToResp loadPassAt dir = case dir of 
+            DirTree.Failed _ _ -> return $ Error NotFound
             DirTree.Dir name contents -> return (Directory (go name contents))
-            DirTree.File name path -> loadPassAt path
+            DirTree.File name path -> do
+                pass <- loadPassAt path
+                return $ either Error Password pass
     where
     go name contents = Tree.Node name $ concatMap go' contents
     go' (DirTree.Failed _ _) = []
     go' (DirTree.Dir name contents) = [go name contents]
     go' (DirTree.File name path) = [go name []]
 
-loadPassAt :: FilePath -> IO Text
-loadPassAt path = 
+loadPassWith :: FilePath -> FilePath -> IO (Either PassError Text.Text)
+loadPassWith binary path = do
+    let process = Proc.proc binary [path]
+    (_, stdout, _, _) <- Proc.createProcess process
+    case stdout of 
+        Nothing -> return $ Left NoHandle 
+        Just stdout -> do
+            output <- TextIO.hGetContents stdout
+            let errorStart = "Error: "
+                errorEnd = " is not in the password store.\n"
+            if Text.take (Text.length errorStart) output == errorStart &&
+                Text.take (Text.length errorEnd) output == errorEnd
+            then return $ Left NotFound
+            else return $ Right output 
+    
